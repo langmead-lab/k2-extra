@@ -1,0 +1,71 @@
+name: viral
+libraries: viral
+extra_k2_args: none
+run_bracken: true
+completed: true
+
+name: microbial
+libraries: archaea bacteria fungi protozoa viral UniVec_Core
+extra_k2_args: none
+run_bracken: true
+completed: true
+
+name: minusb
+libraries: archaea viral plasmid human_nomask UniVec_Core
+extra_k2_args: none
+run_bracken: true
+completed: true
+
+name: standard
+libraries: archaea bacteria viral plasmid human_nomask UniVec_Core
+extra_k2_args: none
+run_bracken: true
+completed: true
+
+name: standard08gb
+libraries: archaea bacteria viral plasmid human_nomask UniVec_Core
+extra_k2_args: --max-db-size 8000000000
+run_bracken: true
+completed: true
+
+name: standard16gb
+libraries: archaea bacteria viral plasmid human_nomask UniVec_Core
+extra_k2_args: --max-db-size 16000000000
+run_bracken: true
+completed: true
+
+name: pluspf
+libraries: archaea bacteria viral plasmid human_nomask UniVec_Core protozoa fungi
+extra_k2_args:
+run_bracken: true
+completed: true
+
+name: pluspf08gb
+libraries: archaea bacteria viral plasmid human_nomask UniVec_Core protozoa fungi
+extra_k2_args: --max-db-size 8000000000
+run_bracken: true
+completed: true
+
+name: pluspf16gb
+libraries: archaea bacteria viral plasmid human_nomask UniVec_Core protozoa fungi
+extra_k2_args: --max-db-size 16000000000
+run_bracken: true
+completed: true
+
+name: pluspfp
+libraries: archaea bacteria viral plasmid human_nomask UniVec_Core protozoa fungi plant
+extra_k2_args: none
+run_bracken: true
+completed: true
+
+name: pluspfp08gb
+libraries: archaea bacteria viral plasmid human_nomask UniVec_Core protozoa fungi plant
+extra_k2_args: --max-db-size 8000000000
+run_bracken: true
+completed: true
+
+name: pluspfp16gb
+libraries: archaea bacteria viral plasmid human_nomask UniVec_Core protozoa fungi plant
+extra_k2_args: --max-db-size 16000000000
+run_bracken: true
+completed: true
