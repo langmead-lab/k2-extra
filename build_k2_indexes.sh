@@ -6,8 +6,8 @@ set -e
 SCRIPT=$(realpath "$0")
 SCRIPT_NAME=$(basename "$SCRIPT")
 USAGE=$(cat <<EOF
-$SCRIPT_NAME [-s] -f file
-$SCRIPT_NAME [-b] [-k extra_k2_args] -i index_name -l libraries
+$SCRIPT_NAME [-sS] -f file -r dir
+$SCRIPT_NAME -r dir [-b] [-k extra_k2_args] -i index_name -l libraries
 
 The first command line runs the script in batch mode; other arguments
 can be provided but will be overridden by those in the file.
@@ -18,13 +18,29 @@ The options are as follows:
     -h  Print this help message and exit
     -i  Give a name to the index
     -k  String of extra arguments to be passed to kraken2-build
-    -l  A space delimited string of libraries needed to build index
+    -l  A space delimited, quoted-string of libraries needed to build index
+    -r  The root directory while index building will take place
     -s  Schedule index building jobs to be run by SLURM
+    -S  Use SSH to parallelize index building jobs, requires host to be set in config file
 EOF
 )
 
-THREADS=6 # $(lscpu | awk '/^CPU\(s\)/ { print $2 }')
-MASKER_THREADS=6
+# Determines the number of threads bracken uses.
+if [ -z "$THREADS" ]; then
+    if [ "$(uname)" = "Linux" ]; then
+        THREADS=$(lscpu | awk '/^CPU\(s\)/ { print $2 }')
+    else
+        THREADS=$(sysctl hw.ncpu | awk '{ print $2 }')
+    fi
+fi
+# Try to keep this at a reasonable number since it determines the
+# number of sockets k2 will open when downloading files from NCBI.
+K2_THREADS=6
+
+# For each of the $K2_THREADS subprocesses that k2 spawns when processing
+# the library files, each subprocess will spawn a masker with this
+# number of threads.
+MASKER_THREADS=4
 
 NCBI_CXX_TOOLKIT="ftp://ftp.ncbi.nih.gov/toolbox/ncbi_tools++/CURRENT/ncbi_cxx--25_2_0.tar.gz"
 
@@ -155,8 +171,7 @@ download_taxonomy() {
     status=$(get_task_status ".downloaded_taxonomy" "success")
     if [ "$status" != "1" ]; then
         k2 download-taxonomy --db .
-    fi
-    set_task_status ".downloaded_taxonomy" "success" 1
+    fi && set_task_status ".downloaded_taxonomy" "success" 1
 }
 
 download_libraries() {
@@ -179,7 +194,8 @@ download_libraries() {
             masker_args="--masker-threads=${MASKER_THREADS}"
         fi
 
-        k2 download-library --db . --library "$lib" --threads ${THREADS} "$masker_args" --log "${lib}.log"
+        k2 download-library --db . --library "$lib" --threads ${K2_THREADS} "$masker_args" --log "${lib}.log"
+        k2 clean --db . --pattern "library/$lib/genomes" --log "${lib}.log"
         success=$?
         if [ -n "$nomask" ]; then
             mv "./library/$lib" "./library/${lib}_nomask"
@@ -195,7 +211,7 @@ get_task_status() {
     filename="$1"
     entry=$2
 
-    if [ ! -e "$filename" ] && grep -Fw "$entry" "$filename" > /dev/null; then
+    if [ -e "$filename" ] && grep -Fw "$entry" "$filename" > /dev/null; then
         status=$(grep -w "$entry" "$filename" | awk '{ print $2 }')
         echo "$status"
     else
@@ -209,7 +225,7 @@ set_task_status() {
     new_status=$1; shift
     extra="$*"
 
-    if grep -Fw "$entry" "$filename" > /dev/null; then
+    if [ -f "$filename" ] && grep -Fw "$entry" "$filename" > /dev/null; then
         old_status=$(get_task_status "$filename" "$entry")
         sed -i -e "/$entry/s/$old_status/$new_status/" "$filename"
     else
@@ -232,7 +248,7 @@ update_index_build_status() {
     fi
 
     # change the 'completed' status of an index
-    sed -i -e "/${index_name}\$/,/completed/{ s/completed: false/completed: true/ }" "$INDEX_RECIPES"
+    sed -i -e "/${index_name}\$/,/completed/s/completed: false/completed: true/" "$INDEX_RECIPES"
 }
 
 finalize_index() {
@@ -274,7 +290,7 @@ finalize_index() {
 }
 
 string_sort() {
-    echo "$1" | tr ' ' '\n' | sort
+    echo "$1" | tr ' ' '\n' | sort | tr '\n' ' '
 }
 
 make_index() {
@@ -297,6 +313,7 @@ make_index() {
 
     cd "$ROOT/kraken2"
     libraries=$(string_sort "$libraries")
+
     if [ -d "$index_name" ]; then
         cd "$index_name"
         existing_libraries=$(ls library)
@@ -332,9 +349,12 @@ get_libraries_from_file() {
     libraries=""
 
     awk '
-        BEGIN { added = 0; lib_count = 0 }
+        BEGIN { added = 0 }
+
+        /^#/ { next }
 
         /libraries/ {
+            lib_count = 0
             for (i = 2; i <= NF; i++) {
                 lib_count += 1
                 libraries[lib_count] = $i
@@ -342,15 +362,16 @@ get_libraries_from_file() {
         }
 
         /completed.*false/ {
-            for (i = 1; i <= lib_count; i++)
-                added += 1
-                output[added] = libraries[lib_count]
-
+            for (i = 1; i <= lib_count; i++) {
+                if (libraries[i] in output)
+                   continue
+                output[libraries[i]] = 1
+            }
         }
 
         END {
-            for (i = 1; i <= added; i++)
-                print libraries[i]
+            for (lib in output)
+                printf "%s ", lib
         }
 ' "$filename"
 }
@@ -406,6 +427,8 @@ build_indexes_from_file() {
         BEGIN { RS = ""; FS = "\n" }
         /completed: false/ {
                     for (i = 1; i <= NF; i++) {
+                        if ($i ~ /^#/)
+                           continue
                         split($i, a, ":[[:space:]]")
                         val[a[1]] = a[2]
                     }
@@ -493,7 +516,6 @@ if [ -n "$*" ]; then
 fi
 
 export PATH="$ROOT/bin:$PATH"
-
 if [ -z "$K2_SLURM_JOB" ]; then
     if [ -n "$batch_filename" ]; then
         libraries=$(get_libraries_from_file "$batch_filename")
