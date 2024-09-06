@@ -387,7 +387,7 @@ build_over_ssh() {
         bracken_arg="-b"
     fi
 
-    has_tmux=$(ssh -n "$host" -- "which tmux -s || echo 1")
+    has_tmux=$(ssh -n "$host" -- "which -s tmux || echo 1")
     if [ "$has_tmux" = "0" ]; then
         has_session=$(ssh -n "$host" -- "tmux has-session -t kraken2 2> /dev/null")
         if [ "$has_session" = "0" ]; then
@@ -403,7 +403,7 @@ build_over_ssh() {
         return
     fi
 
-    has_screen=$(ssh -n "$host" "which screen -s || echo 1")
+    has_screen=$(ssh -n "$host" "which -s screen || echo 1")
     if [ "$has_screen" = "0" ]; then
         has_session=$(ssh -n "$host" -- "screen -ls 2> | grep -F ${index_name}")
         if [ "$has_session" = "0" ]; then
