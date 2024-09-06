@@ -387,8 +387,8 @@ build_over_ssh() {
         bracken_arg="-b"
     fi
 
-    ssh -n "$host" -- "which tmux > /dev/null"
-    if [ $? -eq 0 ]; then
+    has_tmux=$(ssh -n "$host" -- "which tmux -s || echo 1")
+    if [ "$has_tmux" = "0" ]; then
         has_session=$(ssh -n "$host" -- "tmux has-session -t kraken2 2> /dev/null")
         if [ "$has_session" = "0" ]; then
             ssh -n "$host" -- tmux new-session -s kraken2 -d
@@ -396,24 +396,24 @@ build_over_ssh() {
             ssh -n "$host" -- tmux new-window -t kraken2
         fi
 
-        window_index=$(ssh -n "$host" -- tmux list-windows | grep -F active | cut -d: -f1 )
+        window_index=$(ssh -n "$host" -- "tmux list-windows | grep -F active | cut -d: -f1" )
         ssh -n "$host" -- tmux rename-window -t "kraken2:${window_index}" "$index_name"
         ssh -n "$host" -- tmux send-keys -t "kraken2:${index_name}" "\"export INDEX_RECIPES=${INDEX_RECIPES}; sh $SCRIPT -i '$index_name' -l '$libraries' -k '$extra_k2_args' -r '$ROOT' $bracken_arg && exit 0\"" ENTER
 
         return
     fi
 
-    ssh -n "$host" "which screen > /dev/null"
-    if [ $? -eq 0 ]; then
+    has_screen=$(ssh -n "$host" "which screen -s || echo 1")
+    if [ "$has_screen" = "0" ]; then
         has_session=$(ssh -n "$host" -- "screen -ls 2> | grep -F ${index_name}")
         if [ "$has_session" = "0" ]; then
-            ssh -n "$host" -- screen -S kraken2 -X screen -t "$index_name"
+            ssh -n "$host" -- screen -r kraken2 -X screen -t "$index_name"
         else
             ssh -n "$host" -- screen -S kraken2 -d m
-            ssh -n "$host" -- screen -S kraken -p0 title "$index_name"
+            ssh -n "$host" -- screen -r kraken2 -p0 -X title "$index_name"
         fi
 
-        ssh -n "$host" -- screen -S kraken2 -p "$index_name" -X stuff "export INDEX_RECIPES=${INDEX_RECIPES}; sh $SCRIPT -i '$index_name' -l '$libraries' -k '$extra_k2_args' -r '$ROOT' $bracken_arg && exit 0\015"
+        ssh -n "$host" -- screen -r kraken2 -p "$index_name" -X stuff "export INDEX_RECIPES=${INDEX_RECIPES}; sh $SCRIPT -i '$index_name' -l '$libraries' -k '$extra_k2_args' -r '$ROOT' $bracken_arg && exit 0\015"
     fi
 }
 
