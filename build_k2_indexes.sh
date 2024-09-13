@@ -151,7 +151,7 @@ build_k2_index() {
     else
         k2 build --db "$PWD" $@
     fi \
-       && k2 inspect --db "$PWD" > inspect.txt || exit 1
+       && k2 inspect --db "$PWD" --output inspect.txt || exit 1
 }
 
 make_ktaxonomy() {
@@ -197,7 +197,7 @@ download_libraries() {
         k2 download-library --db . --library "$lib" --threads ${K2_THREADS} "$masker_args" --log "${lib}.log"
         k2 clean --db . --pattern "library/$lib/genomes" --log "${lib}.log"
         success=$?
-        if [ -n "$nomask" ]; then
+        if [ "$masker_args" = "--no-masking" ]; then
             mv "./library/$lib" "./library/${lib}_nomask"
             lib="${lib}_nomask"
         fi
@@ -253,14 +253,17 @@ update_index_build_status() {
 
 finalize_index() {
     index=$(basename "$(pwd)")
+    cp "$ROOT/kraken2/taxonomy/names.dmp" "$PWD"
+    cp "$ROOT/kraken2/taxonomy/nodes.dmp" "$PWD"
     filenames="hash.k2d opts.k2d taxo.k2d seqid2taxid.map inspect.txt ktaxonomy.tsv library_report.tsv"
+    filenames="$filenames nodes.dmp names.dmp"
     if [ -n "$run_bracken" ]; then
-        kmer_distrib_files=$(find . -type f -name  "*.kmer_distrib" -print | tr '\n' ' ')
-        filenames="$filenames $kmer_distrib_files"
+        filenames="$filenames database50mers.kmer_distrib database75mers.kmer_distrib database100mers.kmer_distrib database150mers.kmer_distrib database200mers.kmer_distrib database250mers.kmer_distrib database300mers.kmer_distrib"
     fi
     if [ -e "unmapped_accessions.txt" ]; then
        filenames="$filenames unmapped_accessions.txt"
     fi
+
     awk -f "$ROOT/bin/generate_db_report.awk" -F'\t' prelim_map.txt > library_report.tsv
     mkdirs "$ROOT/dbs/$index"
     old_archives=$(find "$ROOT/dbs/$index/" -type f -name "*.tar.gz")
