@@ -181,12 +181,13 @@ download_libraries() {
         touch ".downloaded_libraries"
     fi
 
+    set -o noglob
     for lib in $libraries; do
         status=$(get_task_status ".downloaded_libraries" "$lib")
         if [ "$status" = "1" ]; then
             continue
         fi
-        nomask=""
+
         if [ "$lib" = "human_nomask" ]; then
             masker_args="--no-masking"
             lib="human"
@@ -194,17 +195,26 @@ download_libraries() {
             masker_args="--masker-threads=${MASKER_THREADS}"
         fi
 
-        k2 download-library --db . --library "$lib" --threads ${K2_THREADS} "$masker_args" --log "${lib}.log"
-        k2 clean --db . --pattern "library/$lib/genomes" --log "${lib}.log"
-        success=$?
-        if [ "$masker_args" = "--no-masking" ]; then
-            mv "./library/$lib" "./library/${lib}_nomask"
-            lib="${lib}_nomask"
-        fi
-        if [ "$success" = 0 ]; then
-            set_task_status ".downloaded_libraries" "$lib" 1 $(date +"%Y%m%d")
+        added=$(echo "$lib" | grep "^[[:alpha:]]\+$" || echo "added")
+
+        if [ "$added" = "added" ]; then
+            k2 add-to-library --db . --file "$lib" --threads ${K2_THREADS}
+        else
+            k2 download-library --db . --library "$lib" --threads ${K2_THREADS} "$masker_args" --log "${lib}.log"
+            k2 clean --db . --pattern "library/$lib/genomes" --log "${lib}.log"
+
+            success=$?
+            if [ "$masker_args" = "--no-masking" ]; then
+                mv "./library/$lib" "./library/${lib}_nomask"
+                lib="${lib}_nomask"
+            fi
+
+            if [ "$success" = 0 ]; then
+                set_task_status ".downloaded_libraries" "$lib" 1 $(date +"%Y%m%d")
+            fi
         fi
     done
+    set +o noglob
 }
 
 get_task_status() {
@@ -317,17 +327,17 @@ make_index() {
     cd "$ROOT/kraken2"
     libraries=$(string_sort "$libraries")
 
-    if [ -d "$index_name" ]; then
-        cd "$index_name"
-        existing_libraries=$(ls library)
-        existing_libraries=$(string_sort "$existing_libraries")
+    # if [ -d "$index_name" ]; then
+    #     cd "$index_name"
+    #     existing_libraries=$(ls library)
+    #     existing_libraries=$(string_sort "$existing_libraries")
 
-        if [ "$existing_libraries" != "$libraries" ]; then
-            rm -rf -- *
-        fi
-    else
-        mkdirs "$index_name" && cd "$index_name"
-    fi
+    #     if [ "$existing_libraries" != "$libraries" ]; then
+    #         rm -rf -- *
+    #     fi
+    # else
+    # fi
+    mkdirs "$index_name" && cd "$index_name"
 
     ln -fs "$ROOT/kraken2/taxonomy" .
     mkdirs library && cd library
@@ -390,7 +400,7 @@ build_over_ssh() {
         bracken_arg="-b"
     fi
 
-    has_tmux=$(ssh -n "$host" -- "which -s tmux || echo 1")
+    has_tmux=$(ssh -n "$host" -- "which tmux; echo $?")
     if [ "$has_tmux" = "0" ]; then
         has_session=$(ssh -n "$host" -- "tmux has-session -t kraken2 2> /dev/null")
         if [ "$has_session" = "0" ]; then
@@ -406,13 +416,13 @@ build_over_ssh() {
         return
     fi
 
-    has_screen=$(ssh -n "$host" "which -s screen || echo 1")
+    has_screen=$(ssh -n "$host" "which -s screen; echo $?")
     if [ "$has_screen" = "0" ]; then
-        has_session=$(ssh -n "$host" -- "screen -ls 2> | grep -F ${index_name}")
+        has_session=$(ssh -n "$host" -- "screen -ls 2>&1 | grep -F kraken2; echo $?")
         if [ "$has_session" = "0" ]; then
             ssh -n "$host" -- screen -r kraken2 -X screen -t "$index_name"
         else
-            ssh -n "$host" -- screen -S kraken2 -d m
+            ssh -n "$host" -- screen -S kraken2 -d -m
             ssh -n "$host" -- screen -r kraken2 -p0 -X title "$index_name"
         fi
 
@@ -453,11 +463,30 @@ build_indexes_from_file() {
                     for (v in val)
                         delete val[i]
         }
-' "$filename" | while read -r index_name libraries extra_k2_args run_bracken host; do
+' "$filename" | while read -r index_name libs extra_k2_args run_bracken host; do
+        # remove filepaths in list of libraries; they should exist in added directory
+        set -o noglob
+        libraries=""
+        IFS=$OLDIFS
+        for library in $libs; do
+            library_type=$(echo "$library" | grep "^[[:alpha:]]\+$" || echo "added")
+            if [ "$library_type" = "added" ]; then
+                added="added"
+            else
+                libraries="$libraries $library"
+            fi
+        done
+        if [ -n "$added" ]; then
+            libraries="$libraries added"
+        fi
+        set +o noglob
+        IFS="	"
+
         if [ "$use_slurm" = 1 ]; then
             if [ "$run_bracken" = "true" ]; then
                 bracken_arg="-b"
             fi
+
             cat <<EOF | sed -e 's/^[[:space:]]*//' | sbatch
                  #!/bin/sh
                  #SBATCH --partition=workers
