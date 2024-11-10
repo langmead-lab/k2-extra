@@ -3,25 +3,26 @@
 set -e
 # set -x
 
-SCRIPT=$(realpath "$0")
-SCRIPT_NAME=$(basename "$SCRIPT")
+SCRIPT_PATH=$(realpath "$0")
+SCRIPT_NAME=$(basename "$0")
 USAGE=$(cat <<EOF
-$SCRIPT_NAME [-sS] -f file -r dir
-$SCRIPT_NAME -r dir [-b] [-k extra_k2_args] -i index_name -l libraries
+build_k2_indexes.sh [ -s <slurm_args> | -S <ssh_args> ] [-d] -f file -r <dir>
+build_k2_indexes.sh -r <dir> [-bd] [-k extra_k2_args] -i index_name -l libraries
 
 The first command line runs the script in batch mode; other arguments
 can be provided but will be overridden by those in the file.
 
 The options are as follows:
-    -b  Run bracken on kraken indexes
+    -b  Run bracken on resulting indexes
+    -d  Download all prerequisites needed for building indexes
     -f  Run script in batch mode reading arguments from <file>
     -h  Print this help message and exit
     -i  Give a name to the index
     -k  String of extra arguments to be passed to kraken2-build
     -l  A space delimited, quoted-string of libraries needed to build index
     -r  The root directory while index building will take place
-    -s  Schedule index building jobs to be run by SLURM
-    -S  Use SSH to parallelize index building jobs, requires host to be set in config file
+    -s  SLURM arguments that will be passed to sbatch command
+    -S  The destination, specified as user@host or host, that ssh will connect to
 EOF
 )
 
@@ -56,11 +57,13 @@ install_binaries() {
     if [ ! -e "$ROOT/bin/.installed_binaries" ]; then
         touch "$ROOT/bin/.installed_binaries"
     fi
+
     kraken2_installed=$(get_task_status "$ROOT/bin/.installed_binaries" kraken2)
     maskers_installed=$(get_task_status "$ROOT/bin/.installed_binaries" maskers)
     bracken_installed=$(get_task_status "$ROOT/bin/.installed_binaries" bracken)
     ktaxonomy_installed=$(get_task_status "$ROOT/bin/.installed_binaries" ktaxonomy)
-    db_report_installed=$(get_task_status "$ROOT/bin/.installed_binaries" db_report)
+    k2_extra_installed=$(get_task_status "$ROOT/bin/.installed_binaries" k2_extra)
+
     if [ "$kraken2_installed" = "0" ]; then
         install_kraken2
     fi
@@ -70,11 +73,11 @@ install_binaries() {
     if [ "$ktaxonomy_installed" = "0" ]; then
         install_ktaxonomy
     fi
-    if [ "$db_report_installed" = "0" ]; then
-        install_db_report
-    fi
     if [ "$maskers_installed" = "0" ]; then
         install_maskers
+    fi
+    if [ "$k2_extra_installed" = "0" ]; then
+        install_k2_extra
     fi
 }
 
@@ -88,14 +91,15 @@ install_ktaxonomy() {
     set_task_status "$ROOT/bin/.installed_binaries" "ktaxonomy" "1"
 }
 
-install_db_report() {
+install_k2_extra() {
     cd "$ROOT/tmp"
-    if [ -e k2-extra ]; then
+    if [ -d k2-extra ]; then
         rm -rf k2-extra
     fi
     git clone "https://github.com/langmead-lab/k2-extra" && cd k2-extra
-    cp generate_db_report.awk "$ROOT/bin"
-    set_task_status "$ROOT/bin/.installed_binaries" "db_report" "1"
+    chmod +x build_k2_indexes.sh generate_db_report.awk
+    cp build_k2_indexes.sh generate_db_report.awk "$ROOT/bin"
+    set_task_status "$ROOT/bin/.installed_binaries" "k2_extra" "1"
 }
 
 
@@ -127,8 +131,11 @@ install_maskers() {
 
 install_bracken() {
     cd "$ROOT/tmp"
-    wget "https://github.com/jenniferlu717/Bracken/archive/v2.5.tar.gz"
-    tar xzf v2.5.tar.gz && cd Bracken-2.5
+    if [ -d "Bracken" ]; then
+        rm -rf Bracken
+    fi
+    # wget "https://github.com/jenniferlu717/Bracken/archive/v2.5.tar.gz"
+    # tar xzf v2.5.tar.gz && cd Bracken-2.5
     git clone "https://github.com/jenniferlu717/Bracken" && cd Bracken
     chmod +x bracken-build bracken && cp bracken-build bracken "$ROOT/bin"
     cd src && gmake && mv kmer2read_distr ./*.py "$ROOT/bin"
@@ -137,6 +144,9 @@ install_bracken() {
 
 install_kraken2() {
     cd "$ROOT/tmp"
+    if [ -d "kraken2" ]; then
+        rm -rf kraken2
+    fi
     # wget "https://github.com/DerrickWood/kraken2/archive/v2.1.2.tar.gz"
     # tar xzf v2.1.2.tar.gz && cd kraken2-2.1.2/src && make && make install KRAKEN2_DIR="$ROOT/bin"
     git clone "https://github.com/DerrickWood/kraken2" &&\
@@ -160,10 +170,9 @@ make_ktaxonomy() {
 }
 
 run_bracken() {
-    BRACKEN_THREADS=$((THREADS / 2))
     for read_length in 50 75 100 150 200 250 300; do
-        bracken-build -d . -t ${BRACKEN_THREADS} -l $read_length
-    done || exit 1
+        bracken-build -d . -t "${THREADS}" -l "$read_length"
+    done
 }
 
 download_taxonomy() {
@@ -174,7 +183,16 @@ download_taxonomy() {
     fi && set_task_status ".downloaded_taxonomy" "success" 1
 }
 
+is_downloaded_library() {
+    library=$(echo "$1" | sed -E -ne 's/(_nomask$|$)//p')
+    case "$library" in
+        human | viral | plasmid | protozoa | archaea | fungi | bacteria | plant | UniVec | UniVec_Core) echo 0 ;;
+        *) echo 1 ;;
+    esac
+}
+
 download_libraries() {
+    libs="$1"
     cd "$ROOT/kraken2"
 
     if [ ! -e ".downloaded_libraries" ]; then
@@ -182,12 +200,17 @@ download_libraries() {
     fi
 
     set -o noglob
-    for lib in $libraries; do
+    for lib in $libs; do
+        if [ "$lib" = "none" ] || [ -z "$lib" ]; then
+            continue
+        fi
+
         status=$(get_task_status ".downloaded_libraries" "$lib")
         if [ "$status" = "1" ]; then
             continue
         fi
 
+        # TODO: change this
         if [ "$lib" = "human_nomask" ]; then
             masker_args="--no-masking"
             lib="human"
@@ -195,9 +218,12 @@ download_libraries() {
             masker_args="--masker-threads=${MASKER_THREADS}"
         fi
 
-        added=$(echo "$lib" | grep "^[[:alpha:]]\+$" || echo "added")
+        # downloaded=$(is_downloaded_library "$lib")
+        if [ -f "$lib" ] || echo "$lib" | grep '[/*?]'; then
+            added="true"
+        fi
 
-        if [ "$added" = "added" ]; then
+        if [ "$added" = "true" ]; then
             k2 add-to-library --db . --file "$lib" --threads ${K2_THREADS}
         else
             k2 download-library --db . --library "$lib" --threads ${K2_THREADS} "$masker_args" --log "${lib}.log"
@@ -253,7 +279,7 @@ reset_task_status() {
 
 update_index_build_status() {
     index_name=$1
-    if [ -z "$INDEX_RECIPES" ]; then
+    if [ -z "$INDEX_RECIPES" ] || [ ! -e "$INDEX_RECIPES" ]; then
         return
     fi
 
@@ -312,7 +338,7 @@ make_index() {
         exit 1
     fi
     if [ $# -gt 4 ]; then
-        echo "make_index expects at most 4 arguments, at $# given."
+        echo "make_index expects at most 4 arguments, $# given."
     fi
 
     for i in $(seq 1 $#); do
@@ -339,9 +365,18 @@ make_index() {
     # fi
     mkdirs "$index_name" && cd "$index_name"
 
-    ln -fs "$ROOT/kraken2/taxonomy" .
+    # Special databases such as GTDB and Greengenes come
+    # with the own taxonomy files. Do not try to create a
+    # symlink in such circumstances.
+    if [ ! -d "taxonomy" ]; then
+        ln -fs "$ROOT/kraken2/taxonomy" .
+    fi
     mkdirs library && cd library
+
     for lib in $libraries; do
+        if [ "$lib" != "none" ]; then
+            continue
+        fi
         ln -fs "$ROOT/kraken2/library/$lib" .
     done && cd "$ROOT/kraken2/$index_name"
     if [ "$extra_k2_args" = "none" ]; then
@@ -383,12 +418,49 @@ get_libraries_from_file() {
         }
 
         END {
-            for (lib in output)
-                printf "%s ", lib
+            print_space = 0
+            for (lib in output) {
+                if (print_space == 1)
+                   printf " "
+                printf "%s", lib
+                print_space = 1
+            }
         }
 ' "$filename"
 }
 
+build_using_slurm() {
+    index_name=$1
+    libraries=$2
+    extra_k2_args=$3
+    run_bracken=$4
+    slurm_args=$5
+
+    if [ "$run_bracken" = "true" ]; then
+        bracken_arg="-b"
+    else
+        bracken_arg=
+    fi
+
+    index_recipes=
+    sbcast_command=
+    if [ -n "$batch_filename" ]; then
+        basename=$(basename "$batch_filename")
+        index_recipes="$ROOT/$basename"
+        sbcast_command="sbcast $index_recipes '$ROOT'; sbcast $batch_filename '$ROOT'"
+    fi
+
+    cat <<EOF | sed -e 's/^[[:space:]]*//' | sbatch
+        #!/bin/sh
+        #SBATCH $slurm_args
+        export K2_SLURM_JOB=1
+        IFS=$OLDIFS
+        export INDEX_RECIPES=$index_recipes
+        $sbcast_command
+        sh $ROOT/$SCRIPT -i '$index_name' -l '$libraries' -k '$extra_k2_args' -r '$ROOT' $bracken_arg
+EOF
+
+}
 build_over_ssh() {
     index_name=$1
     libraries=$2
@@ -398,42 +470,66 @@ build_over_ssh() {
 
     if [ "$run_bracken" = "true" ]; then
         bracken_arg="-b"
+    else
+        bracken_arg=
     fi
 
-    has_tmux=$(ssh -n "$host" -- "which tmux; echo $?")
+    index_recipes=
+    sbcast_command=
+    if [ -n "$batch_filename" ]; then
+        basename=$(basename "$batch_filename")
+        INDEX_RECIPES="$ROOT/$basename"
+        ssh -n "$host" "mkdir -p '$ROOT'"
+        scp "$batch_filename" "$host:$ROOT"
+        scp "$SCRIPT_PATH" "$host:$ROOT"
+
+    fi
+
+    command="export INDEX_RECIPES='$INDEX_RECIPES'; sh $ROOT/$SCRIPT_NAME -i '$index_name' -l '$libraries' -k '$extra_k2_args' ${bracken_arg} -r '$ROOT'"
+
+    has_tmux=$(ssh -n "$host" -- "which tmux 2>&1 > /dev/null; echo $?")
     if [ "$has_tmux" = "0" ]; then
-        has_session=$(ssh -n "$host" -- "tmux has-session -t kraken2 2> /dev/null")
+        has_session=$(ssh -n "$host" -- "tmux has-session -t kraken2 2>&1 > /dev/null; echo $?")
         if [ "$has_session" = "0" ]; then
-            ssh -n "$host" -- tmux new-session -s kraken2 -d
-        else
             ssh -n "$host" -- tmux new-window -t kraken2
+        else
+            ssh -n "$host" -- tmux new-session -s kraken2 -d
         fi
 
         window_index=$(ssh -n "$host" -- "tmux list-windows | grep -F active | cut -d: -f1" )
         ssh -n "$host" -- tmux rename-window -t "kraken2:${window_index}" "$index_name"
-        ssh -n "$host" -- tmux send-keys -t "kraken2:${index_name}" "\"export INDEX_RECIPES=${INDEX_RECIPES}; sh $SCRIPT -i '$index_name' -l '$libraries' -k '$extra_k2_args' -r '$ROOT' $bracken_arg && exit 0\"" ENTER
+        ssh -n "$host" -- tmux send-keys -t "kraken2:${index_name}" "\"$command\"" ENTER
 
         return
     fi
 
-    has_screen=$(ssh -n "$host" "which -s screen; echo $?")
+    has_screen=$(ssh -n "$host" "which screen 2>&1 > /dev/null; echo $?")
     if [ "$has_screen" = "0" ]; then
-        has_session=$(ssh -n "$host" -- "screen -ls 2>&1 | grep -F kraken2; echo $?")
-        if [ "$has_session" = "0" ]; then
+        has_session=$(ssh -n "$host" -- "screen -ls 2>&1 | grep -F kraken2" || echo "not found")
+        if [ "$has_session" != "not found" ]; then
             ssh -n "$host" -- screen -r kraken2 -X screen -t "$index_name"
         else
             ssh -n "$host" -- screen -S kraken2 -d -m
             ssh -n "$host" -- screen -r kraken2 -p0 -X title "$index_name"
         fi
 
-        ssh -n "$host" -- screen -r kraken2 -p "$index_name" -X stuff "export INDEX_RECIPES=${INDEX_RECIPES}; sh $SCRIPT -i '$index_name' -l '$libraries' -k '$extra_k2_args' -r '$ROOT' $bracken_arg && exit 0\015"
+        ssh -n "$host" -- screen -r kraken2 -p "$index_name" -X stuff "\"$command\""
+
+        return
     fi
+
+    if [ -x nohup ]; then
+        ssh -n "host" -- nohup "$command"
+        return
+    fi
+
+    echo "Could not find tmux, screen or nohup on " $( echo "${host}" | cut -d '@' -f2 ) " ..exiting"
+    exit 1
+
 }
 
 build_indexes_from_file() {
     filename="$1"
-    use_slurm=$2
-    export INDEX_RECIPES="$(realpath $filename)"
     OLDIFS=$IFS
     IFS="	"
     awk '
@@ -445,64 +541,65 @@ build_indexes_from_file() {
                         split($i, a, ":[[:space:]]")
                         val[a[1]] = a[2]
                     }
-                    if ("host" in val) {
-                        printf("%s\t%s\t%s\t%s\t%s\n",
+                    if ("ssh_args" in val && val["ssh_args"] != "none") {
+                        printf("%s\t%s\t%s\t%s\t%s\t%s\n",
                                val["name"],
                                val["libraries"],
                                val["extra_k2_args"],
                                val["run_bracken"],
-                               val["host"])
+                               "ssh",
+                               val["ssh_args"])
 
-                    } else {
-                        printf("%s\t%s\t%s\t%s\n",
+                    } else if ("slurm_args" in val && val["slurm_args"] != "none"){
+                        printf("%s\t%s\t%s\t%s\t%s\t%s\n",
                                val["name"],
                                val["libraries"],
                                val["extra_k2_args"],
-                               val["run_bracken"])
+                               val["run_bracken"],
+                               "slurm",
+                               val["slurm_args"])
+
+                    } else {
+                        printf("%s\t%s\t%s\t%s\t%s\t%s\n",
+                               val["name"],
+                               val["libraries"],
+                               val["extra_k2_args"],
+                               val["run_bracken"],
+                               "none",
+                               "none")
                     }
                     for (v in val)
                         delete val[i]
         }
-' "$filename" | while read -r index_name libs extra_k2_args run_bracken host; do
+' "$filename" | while read -r index_name libs extra_k2_args run_bracken sched_type sched_args; do
         # remove filepaths in list of libraries; they should exist in added directory
         set -o noglob
         libraries=""
         IFS=$OLDIFS
         for library in $libs; do
-            library_type=$(echo "$library" | grep "^[[:alpha:]]\+$" || echo "added")
-            if [ "$library_type" = "added" ]; then
-                added="added"
+            # downloaded=$(is_downloaded_library "$library")
+            if [ -f "$library" ] || echo "$library" | grep '[/*?]'; then
+                added="true"
             else
                 libraries="$libraries $library"
             fi
         done
-        if [ -n "$added" ]; then
+        if [ "$added" = "true" ]; then
             libraries="$libraries added"
         fi
         set +o noglob
         IFS="	"
 
-        if [ "$use_slurm" = 1 ]; then
-            if [ "$run_bracken" = "true" ]; then
-                bracken_arg="-b"
-            fi
-
-            cat <<EOF | sed -e 's/^[[:space:]]*//' | sbatch
-                 #!/bin/sh
-                 #SBATCH --partition=workers
-                 #SBATCH --nodes=1
-                 #SBATCH --job-name=building_${index_name}
-                 export INDEX_RECIPES=$INDEX_RECIPES
-                 export K2_SLURM_JOB=1
-                 IFS=$OLDIFS
-                 sh $SCRIPT -i '$index_name' -l '$libraries' -k '$extra_k2_args' -r '$ROOT' $bracken_arg
-EOF
-        elif [ "$use_ssh" = 1 ]; then
+        if [ "$sched_type" = "slurm" ]; then
+            build_using_slurm "$index_name" "$libraries" "$extra_k2_args" "$run_bracken" "$sched_args"
+        elif [ "$sched_type" = "ssh" ]; then
+            echo "$sched_args"
             IFS=" "
-            build_over_ssh "$index_name" "$libraries" "$extra_k2_args" "$run_bracken" "$host"
+            build_over_ssh "$index_name" "$libraries" "$extra_k2_args" "$run_bracken" "$sched_args"
             IFS="	"
         else
             IFS=" "
+            setup_dependencies "$libs"
             make_index "$index_name" "$libraries" "$extra_k2_args" "$run_bracken"
             IFS="	"
 
@@ -514,27 +611,39 @@ EOF
 
 setup_dependencies() {
     mkdirs "$ROOT/bin" "$ROOT/dbs" "$ROOT/kraken2" "$ROOT/tmp" && \
-    install_binaries && \
-    download_taxonomy && \
-    download_libraries "$1"
+    install_binaries
+    if [ "$1" != "none" ]; then
+        download_taxonomy
+        download_libraries "$1"
+    fi
 }
 
 print_usage() {
     printf "%s\n" "$USAGE"
 }
 
+clean_up() {
+    if [ -f "$ROOT/.lock" ]; then
+        rm -f "$ROOT/.lock"
+    fi
+}
+
+trap clean_up EXIT
+trap clean_up INT
+trap clean_up QUIT
+
 [ $# -eq 0 ] && print_usage && exit
 
-while getopts "bf:hi:k:l:r:sS" opt; do
+while getopts "bf:hi:k:l:r:s:S:" opt; do
     case $opt in
-        b) use_bracken="true" ;;
+        b) run_bracken="true" ;;
         f) batch_filename=$(realpath "$OPTARG") ;;
         i) index_name="$OPTARG" ;;
         l) libraries="$OPTARG" ;;
         k) extra_k2_args="$OPTARG" ;;
         r) ROOT="$OPTARG" ;;
-        s) use_slurm=1 ;;
-        S) use_ssh=1 ;;
+        s) slurm_args="$OPTARG" ;;
+        S) ssh_args="$OPTARG" ;;
         h) print_usage && exit 1 ;;
         ?) print_usage && exit 1 ;;
     esac
@@ -548,14 +657,30 @@ if [ -n "$*" ]; then
 fi
 
 export PATH="$ROOT/bin:$PATH"
-if [ -z "$K2_SLURM_JOB" ]; then
-    if [ -n "$batch_filename" ]; then
-        libraries=$(get_libraries_from_file "$batch_filename")
-    fi
-    setup_dependencies "$libraries"
-fi
+
 if [ -n "$batch_filename" ]; then
-    build_indexes_from_file "$batch_filename" "$use_slurm"
+    libraries=$(get_libraries_from_file "$batch_filename")
+    build_indexes_from_file "$batch_filename"
 else
-    make_index "$index_name" "$libraries" "$extra_k2_args" "$use_bracken"
+    if [ -n "$slurm_args" ] && [ "$slurm_args" != "none" ]; then
+        build_using_slurm "$index_name" "$libraries" "$extra_k2_args" "$run_bracken" "$slurm_args"
+    elif [ -n "$ssh_args" ] && [ "$ssh_args" != "none" ]; then
+        build_over_ssh "$index_name" "$libraries" "$extra_k2_args" "$run_bracken" "$ssh_args"
+    else
+        if [ -e "$ROOT/.dep_lock" ]; then
+            while [ -f "$ROOT/.dep_lock" ]; do
+                sleep 1
+            done
+        else
+            touch "$ROOT/.dep_lock"
+            if [ -n "$INDEX_RECIPES" ]; then
+                all_libraries=$(get_libraries_from_file "$INDEX_RECIPES")
+                setup_dependencies "$all_libraries"
+            else
+                setup_dependencies "$libraries"
+            fi
+            rm "$ROOT/.dep_lock"
+        fi
+        make_index "$index_name" "$libraries" "$extra_k2_args" "$run_bracken"
+    fi
 fi
