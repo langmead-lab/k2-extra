@@ -12,12 +12,12 @@ BEGIN {
 
 {
     sub(/kraken:taxid\|[0-9]+\|/, "", $2)
-    name = ">"$2 " " $4
-    ftp_url = "ftp://" NCBI_SERVER "/" $5
+    name = $2 " " $4
+    url = $5
     if ($1 ~ /TAXID/) {
-        records[$2] = library"\t"name"\t"ftp_url
+        records[$2] = library"\t"name"\t"url
     } else {
-        records[$3] = library"\t"name"\t"ftp_url
+        records[$3] = library"\t"name"\t"url
     }
 }
 
